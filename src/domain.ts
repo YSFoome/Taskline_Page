@@ -171,6 +171,60 @@ export function spawnNextRecurringTask(snapshot: AppSnapshot, task: Task): Task 
   return next;
 }
 
+export function transitionTaskStatus(snapshot: AppSnapshot, taskId: string, targetStatusId: string): void {
+  const task = snapshot.tasks.find((candidate) => candidate.id === taskId);
+  const targetStatus = snapshot.statuses.find((status) => status.id === targetStatusId);
+  if (!task || !targetStatus || task.statusId === targetStatusId) return;
+  const previousStatusId = task.statusId;
+  const previousStatus = snapshot.statuses.find((status) => status.id === previousStatusId);
+  task.statusId = targetStatusId;
+  task.sortOrder = tasksForStatus(snapshot, targetStatusId).length;
+  touchTask(task);
+  if (targetStatus.isDone && !previousStatus?.isDone) {
+    task.completedAt = nowIso();
+    const next = spawnNextRecurringTask(snapshot, task);
+    if (next) snapshot.tasks.push(next);
+  } else if (!targetStatus.isDone) {
+    task.completedAt = undefined;
+  }
+  renumberTasks(snapshot, previousStatusId);
+  renumberTasks(snapshot, targetStatusId);
+}
+
+export function completeTask(snapshot: AppSnapshot, taskId: string): void {
+  const target = doneStatus(snapshot);
+  transitionTaskStatus(snapshot, taskId, target.id);
+}
+
+export type BatchOperation =
+  | { type: 'archive' }
+  | { type: 'move-status'; statusId: string }
+  | { type: 'add-tags'; tags: string[] }
+  | { type: 'remove-tags'; tags: string[] };
+
+export function applyBatchOperation(snapshot: AppSnapshot, taskIds: string[], operation: BatchOperation): void {
+  const ids = [...new Set(taskIds)];
+  if (operation.type === 'move-status') {
+    ids.forEach((id) => transitionTaskStatus(snapshot, id, operation.statusId));
+    return;
+  }
+  const affectedStatuses = new Set<string>();
+  ids.forEach((id) => {
+    const task = snapshot.tasks.find((candidate) => candidate.id === id);
+    if (!task) return;
+    affectedStatuses.add(task.statusId);
+    if (operation.type === 'archive') {
+      task.archived = true;
+    } else if (operation.type === 'add-tags') {
+      task.tags = [...new Set([...task.tags, ...operation.tags])];
+    } else {
+      task.tags = task.tags.filter((tag) => !operation.tags.includes(tag));
+    }
+    touchTask(task);
+  });
+  affectedStatuses.forEach((statusId) => renumberTasks(snapshot, statusId));
+}
+
 export function normalizeSnapshot(snapshot: AppSnapshot): AppSnapshot {
   const normalized = cloneSnapshot(snapshot);
   normalized.schemaVersion = CURRENT_SCHEMA_VERSION;
@@ -188,3 +242,4 @@ export function normalizeSnapshot(snapshot: AppSnapshot): AppSnapshot {
   }));
   return normalized;
 }
+

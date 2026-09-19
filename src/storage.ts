@@ -2,6 +2,12 @@ import { openDB, type DBSchema } from 'idb';
 import { createInitialSnapshot, normalizeSnapshot } from './domain';
 import type { PersistedState, SyncConfig } from './types';
 
+export interface UiPreferences {
+  version: 1;
+  theme: 'system' | 'light' | 'dark';
+  accentColor: string;
+}
+
 interface TasklineDb extends DBSchema {
   state: {
     key: string;
@@ -52,6 +58,17 @@ export function saveTheme(theme: 'system' | 'light' | 'dark'): void {
   localStorage.setItem('taskline-theme', theme);
 }
 
+const DEFAULT_ACCENT = '#2563eb';
+
+export function readAccentColor(): string {
+  const value = localStorage.getItem('taskline-accent');
+  return value && /^#[0-9a-f]{6}$/i.test(value) ? value : DEFAULT_ACCENT;
+}
+
+export function saveAccentColor(color: string): void {
+  if (/^#[0-9a-f]{6}$/i.test(color)) localStorage.setItem('taskline-accent', color);
+}
+
 export function exportState(state: PersistedState): string {
   const payload = {
     exportedAt: new Date().toISOString(),
@@ -75,3 +92,4 @@ export function downloadText(filename: string, contents: string, type = 'applica
   anchor.click();
   URL.revokeObjectURL(url);
 }
+
