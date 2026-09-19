@@ -201,7 +201,73 @@ function App() {
       const previousStatus = snapshot.statuses.find((status) => status.id === task.statusId);
       Object.assign(task, patch);
       touchTask(task);
-      coblings.forEach((candidate, index) => { candidate.sortOrder = index; });
+      const nextStatus = snapshot.statuses.find((status) => status.id === task.statusId);
+      if (nextStatus?.isDone && !previousStatus?.isDone) {
+        task.completedAt = nowIso();
+        const next = spawnNextRecurringTask(snapshot, task);
+        if (next) snapshot.tasks.push(next);
+      } else if (!nextStatus?.isDone) {
+        task.completedAt = undefined;
+      }
+      renumberTasks(snapshot, task.statusId);
+    }, message);
+  };
+
+  const moveTaskToStatus = (id: string, statusId: string) => {
+    updateTask(id, { statusId, sortOrder: tasksForStatus(state!.snapshot, statusId).length }, '任务已移动。');
+  };
+
+  const addQuickTask = (event: FormEvent) => {
+    event.preventDefault();
+    const title = quickTitle.trim();
+    if (!title || !state) return;
+    const status = firstActiveStatus(state.snapshot);
+    const task = createTask(title, status.id, tasksForStatus(state.snapshot, status.id).length);
+    mutateSnapshot((snapshot) => snapshot.tasks.push(task), '已添加到待办。');
+    setQuickTitle('');
+    setSelectedTaskId(task.id);
+  };
+
+  const addTaskInStatus = (statusId: string) => {
+    if (!state) return;
+    const title = window.prompt('新任务标题');
+    if (!title?.trim()) return;
+    const task = createTask(title, statusId, tasksForStatus(state.snapshot, statusId).length);
+    mutateSnapshot((snapshot) => snapshot.tasks.push(task), '已添加任务。');
+    setSelectedTaskId(task.id);
+  };
+
+  const removeTask = (id: string) => {
+    if (!state || !window.confirm('删除后会在同步文件中留下删除标记，确定删除这个任务吗？')) return;
+    mutateSnapshot((snapshot) => {
+      snapshot.tasks = snapshot.tasks.filter((task) => task.id !== id);
+      snapshot.tombstones.push({ id, entity: 'task', deletedAt: nowIso() });
+    }, '任务已删除。');
+    setSelectedTaskId(null);
+  };
+
+  const toggleArchive = (id: string, archived: boolean) => {
+    updateTask(id, { archived }, archived ? '任务已归档。' : '任务已恢复。');
+    if (archived) setSelectedTaskId(null);
+  };
+
+  const handleBoardDragEnd = (event: DragEndEvent) => {
+    if (!state || !event.over) return;
+    const activeId = String(event.active.id);
+    const overId = String(event.over.id);
+    if (!activeId.startsWith('task:')) return;
+    const taskId = activeId.slice(5);
+    const overTask = overId.startsWith('task:') ? state.snapshot.tasks.find((task) => task.id === overId.slice(5)) : undefined;
+    const statusId = overId.startsWith('status:') ? overId.slice(7) : overTask?.statusId;
+    if (!statusId) return;
+    mutateSnapshot((snapshot) => {
+      const task = snapshot.tasks.find((candidate) => candidate.id === taskId);
+      if (!task) return;
+      const siblings = tasksForStatus(snapshot, statusId).filter((candidate) => candidate.id !== taskId);
+      const targetIndex = overTask ? Math.max(0, siblings.findIndex((candidate) => candidate.id === overTask.id)) : siblings.length;
+      task.statusId = statusId;
+      siblings.splice(targetIndex < 0 ? siblings.length : targetIndex, 0, task);
+      siblings.forEach((candidate, index) => { candidate.sortOrder = index; });
       touchTask(task);
     }, '任务顺序已更新。');
   };
@@ -489,7 +555,145 @@ function App() {
               snapshot.tombstones.push({ id, entity: 'status', deletedAt: nowIso() });
             }, '看板列已删除。')}
             onAddField={(field) => mutateSnapshot((snapshot) => snapshot.customFields.push(field), '自定义字段已添加。')}
-            onUpdateFiedueDate ? `截止 ${formatShortDate(task.dueDate)}` : '无截止日期'}{task.tags.length ? ` · ${task.tags.slice(0, 2).map((tag) => `#${tag}`).join(' ')}` : ''}</small></span><Icon name="arrow" /></button>)}</div> : <div className="empty-state compact"><span className="empty-glyph">◷</span><strong>这一天还没有任务</strong><p>在看板快速记录，或把任务拖到这里。</p></div>}</aside>
+            onUpdateField={(id, patch) => mutateSnapshot((snapshot) => {
+              const field = snapshot.customFields.find((candidate) => candidate.id === id);
+              if (field) Object.assign(field, patch);
+            }, '自定义字段已更新。')}
+            onDeleteField={(id) => mutateSnapshot((snapshot) => {
+              const field = snapshot.customFields.find((candidate) => candidate.id === id);
+              if (field) field.archived = true;
+            }, '自定义字段已停用，历史值仍会保留。')}
+          />
+        )}
+      </main>
+
+      <nav className="mobile-nav" aria-label="移动端主导航">
+        <NavButton active={view === 'board'} icon="board" label="看板" onClick={() => setView('board')} />
+        <NavButton active={view === 'calendar'} icon="calendar" label="月历" onClick={() => setView('calendar')} />
+        <NavButton active={view === 'archive'} icon="archive" label="归档" onClick={() => setView('archive')} />
+        <NavButton active={view === 'settings'} icon="settings" label="设置" onClick={() => setView('settings')} />
+      </nav>
+
+      {selectedTask && (
+        <TaskEditor
+          task={selectedTask}
+          snapshot={state.snapshot}
+          onClose={() => setSelectedTaskId(null)}
+          onUpdate={(patch) => updateTask(selectedTask.id, patch)}
+          onDelete={() => removeTask(selectedTask.id)}
+          onToggleArchive={() => toggleArchive(selectedTask.id, !selectedTask.archived)}
+          onMoveStatus={(statusId) => moveTaskToStatus(selectedTask.id, statusId)}
+          onAddChecklist={(text) => updateTask(selectedTask.id, { checklist: [...selectedTask.checklist, createCheckItem(text)] })}
+          onToggleChecklist={(itemId) => updateTask(selectedTask.id, { checklist: selectedTask.checklist.map((item) => item.id === itemId ? { ...item, done: !item.done } : item) })}
+          onDeleteChecklist={(itemId) => updateTask(selectedTask.id, { checklist: selectedTask.checklist.filter((item) => item.id !== itemId) })}
+        />
+      )}
+
+      {syncDraft && (
+        <ConflictPanel
+          draft={syncDraft}
+          onResolve={resolveConflict}
+          onCancel={() => setSyncDraft(null)}
+          onFinish={() => void finishConflictSync()}
+        />
+      )}
+
+      {toast && <div className="toast" role="status"><span>{toast}</span>{undoSnapshot && <button onClick={undo}><Icon name="undo" /> 撤销</button>}</div>}
+    </div>
+  );
+}
+
+function NavButton({ active, icon, label, count, onClick }: { active: boolean; icon: string; label: string; count?: number; onClick: () => void }) {
+  return <button className={`nav-button ${active ? 'active' : ''}`} onClick={onClick}><Icon name={icon} /><span>{label}</span>{count ? <em>{count}</em> : null}</button>;
+}
+
+function FilterBar({
+  dateFilter, setDateFilter, priorityFilter, setPriorityFilter, statusFilter, setStatusFilter, statuses
+}: {
+  dateFilter: DateFilter; setDateFilter: (value: DateFilter) => void;
+  priorityFilter: Priority | 'all'; setPriorityFilter: (value: Priority | 'all') => void;
+  statusFilter: string; setStatusFilter: (value: string) => void; statuses: StatusColumn[];
+}) {
+  return <div className="filter-bar">
+    <div className="filter-group">
+      <button className={`filter-pill ${dateFilter === 'today' ? 'selected' : ''}`} onClick={() => setDateFilter(dateFilter === 'today' ? 'all' : 'today')}><Icon name="today" /> 今天</button>
+      <button className={`filter-pill ${dateFilter === 'overdue' ? 'selected danger' : ''}`} onClick={() => setDateFilter(dateFilter === 'overdue' ? 'all' : 'overdue')}>逾期</button>
+    </div>
+    <label className="compact-select"><span className="sr-only">优先级</span><select value={priorityFilter} onChange={(event) => setPriorityFilter(event.target.value as Priority | 'all')}><option value="all">所有优先级</option>{Object.entries(priorityLabels).filter(([key]) => key !== 'none').map(([key, label]) => <option value={key} key={key}>{label}</option>)}</select></label>
+    <label className="compact-select"><span className="sr-only">状态</span><select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="all">所有状态</option>{statuses.map((status) => <option value={status.id} key={status.id}>{status.name}</option>)}</select></label>
+  </div>;
+}
+
+function BoardView({
+  snapshot, tasks, quickTitle, setQuickTitle, onQuickAdd, dateFilter, setDateFilter, priorityFilter, setPriorityFilter,
+  statusFilter, setStatusFilter, onSelectTask, onDragEnd, onMoveColumn, onAddColumn, onAddTaskInStatus
+}: {
+  snapshot: AppSnapshot; tasks: Task[]; quickTitle: string; setQuickTitle: (value: string) => void; onQuickAdd: (event: FormEvent) => void;
+  dateFilter: DateFilter; setDateFilter: (value: DateFilter) => void; priorityFilter: Priority | 'all'; setPriorityFilter: (value: Priority | 'all') => void;
+  statusFilter: string; setStatusFilter: (value: string) => void; onSelectTask: (id: string) => void; onDragEnd: (event: DragEndEvent) => void;
+  onMoveColumn: (id: string, direction: number) => void; onAddColumn: () => void; onAddTaskInStatus: (id: string) => void;
+}) {
+  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }), useSensor(KeyboardSensor));
+  const statuses = activeStatuses(snapshot);
+  return <section className="workspace board-workspace">
+    <div className="workspace-intro"><div><h2>把要做的事放到正确的列里</h2><p>先收集，再推进；完成的事情留在这里，方便回顾。</p></div><div className="workspace-count"><strong>{tasks.length}</strong><span>个当前任务</span></div></div>
+    <form className="quick-add" onSubmit={onQuickAdd}><span className="quick-add-mark"><Icon name="plus" /></span><input value={quickTitle} onChange={(event) => setQuickTitle(event.target.value)} placeholder="快速记录一件要做的事…" aria-label="快速记录任务" /><button className="button button-primary" type="submit">添加任务 <span className="shortcut-hint">↵</span></button></form>
+    <FilterBar dateFilter={dateFilter} setDateFilter={setDateFilter} priorityFilter={priorityFilter} setPriorityFilter={setPriorityFilter} statusFilter={statusFilter} setStatusFilter={setStatusFilter} statuses={statuses} />
+    <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={onDragEnd}>
+      <div className="board-scroll"><div className="board-grid">
+        {statuses.map((status, index) => <BoardColumn key={status.id} status={status} index={index} total={statuses.length} tasks={tasks.filter((task) => task.statusId === status.id)} onSelectTask={onSelectTask} onMoveColumn={onMoveColumn} onAddTask={() => onAddTaskInStatus(status.id)} />)}
+        <button className="add-column-card" onClick={onAddColumn}><Icon name="plus" /><span>添加看板列</span></button>
+      </div></div>
+      <DragOverlay>{null}</DragOverlay>
+    </DndContext>
+  </section>;
+}
+
+function BoardColumn({ status, index, total, tasks, onSelectTask, onMoveColumn, onAddTask }: { status: StatusColumn; index: number; total: number; tasks: Task[]; onSelectTask: (id: string) => void; onMoveColumn: (id: string, direction: number) => void; onAddTask: () => void }) {
+  const { isOver, setNodeRef } = useDroppable({ id: `status:${status.id}` });
+  return <div className={`board-column ${isOver ? 'is-over' : ''}`} ref={setNodeRef}>
+    <div className="column-heading"><span className="status-color" style={{ background: status.color }} /><strong>{status.name}</strong><span className="column-count">{tasks.length}</span><div className="column-actions"><button aria-label="看板列左移" disabled={index === 0} onClick={() => onMoveColumn(status.id, -1)}>‹</button><button aria-label="看板列右移" disabled={index === total - 1} onClick={() => onMoveColumn(status.id, 1)}>›</button></div></div>
+    <SortableContext items={tasks.map((task) => `task:${task.id}`)} strategy={verticalListSortingStrategy}>
+      <div className="column-tasks">{tasks.map((task) => <SortableTaskCard key={task.id} task={task} onSelect={() => onSelectTask(task.id)} />)}{tasks.length === 0 && <div className="column-empty">把任务拖到这里</div>}</div>
+    </SortableContext>
+    <button className="column-add" onClick={onAddTask}><Icon name="plus" /> 添加任务</button>
+  </div>;
+}
+
+function SortableTaskCard({ task, onSelect }: { task: Task; onSelect: () => void }) {
+  const { attributes, listeners, setNodeRef, transform, isDragging } = useSortable({ id: `task:${task.id}` });
+  const style: CSSProperties = { transform: CSS.Transform.toString(transform) };
+  return <article ref={setNodeRef} style={style} className={`task-card ${isDragging ? 'is-dragging' : ''}`} {...attributes} {...listeners} onClick={onSelect}>
+    <div className="task-card-title">{task.title}</div>
+    <div className="task-card-meta">{task.priority !== 'none' && <span className={`priority-dot ${task.priority}`} title={priorityLabels[task.priority]} />}{task.dueDate && <span className={task.dueDate < todayString() && !task.completedAt ? 'date-overdue' : ''}><Icon name="calendar" /> {formatShortDate(task.dueDate)}</span>}{task.checklist.length > 0 && <span><Icon name="check" /> {task.checklist.filter((item) => item.done).length}/{task.checklist.length}</span>}</div>
+    {task.tags.length > 0 && <div className="task-tags">{task.tags.slice(0, 3).map((tag) => <span key={tag}>#{tag}</span>)}</div>}
+  </article>;
+}
+
+function CalendarTask({ task, onSelect }: { task: Task; onSelect: () => void }) {
+  const { attributes, listeners, setNodeRef, transform } = useDraggable({ id: `calendar-task:${task.id}` });
+  const style: CSSProperties = { transform: CSS.Translate.toString(transform) };
+  return <button ref={setNodeRef} style={style} {...attributes} {...listeners} className="calendar-task" onClick={(event) => { event.stopPropagation(); onSelect(); }}><span className={`priority-bar ${task.priority}`} />{task.title}</button>;
+}
+
+function CalendarDay({ date, month, tasks, selected, onSelect, onSelectTask }: { date: Date; month: Date; tasks: Task[]; selected: boolean; onSelect: () => void; onSelectTask: (id: string) => void }) {
+  const dateValue = format(date, 'yyyy-MM-dd');
+  const { isOver, setNodeRef } = useDroppable({ id: `date:${dateValue}` });
+  return <div ref={setNodeRef} className={`calendar-day ${!isSameMonth(date, month) ? 'muted' : ''} ${selected ? 'selected' : ''} ${isOver ? 'is-over' : ''}`} onClick={onSelect}>
+    <div className="day-number"><span>{format(date, 'd')}</span>{isSameDay(date, new Date()) && <i>今天</i>}</div>
+    <div className="day-tasks">{tasks.slice(0, 3).map((task) => <CalendarTask key={task.id} task={task} onSelect={() => onSelectTask(task.id)} />)}{tasks.length > 3 && <span className="more-tasks">+{tasks.length - 3} 项</span>}</div>
+  </div>;
+}
+
+function CalendarView({ snapshot, tasks, month, selectedDate, onMonthChange, onSelectDate, onSelectTask, onDragEnd }: { snapshot: AppSnapshot; tasks: Task[]; month: Date; selectedDate: string; onMonthChange: (date: Date) => void; onSelectDate: (date: string) => void; onSelectTask: (id: string) => void; onDragEnd: (event: DragEndEvent) => void }) {
+  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 4 } }));
+  const days = eachDayOfInterval({ start: startOfWeek(startOfMonth(month), { weekStartsOn: 1 }), end: endOfWeek(endOfMonth(month), { weekStartsOn: 1 }) });
+  const dayTasks = tasks.filter((task) => taskCoversDate(task, selectedDate)).sort((a, b) => (a.dueDate ?? '').localeCompare(b.dueDate ?? ''));
+  return <section className="workspace calendar-workspace">
+    <div className="workspace-intro calendar-intro"><div><h2>{format(month, 'yyyy年M月')}</h2><p>拖动任务到另一个日期，保留原来的执行跨度。</p></div><div className="calendar-controls"><button className="icon-button" onClick={() => onMonthChange(subMonths(month, 1))} aria-label="上个月"><Icon name="back" /></button><button className="button button-ghost" onClick={() => { onMonthChange(startOfMonth(new Date())); onSelectDate(todayString()); }}>回到今天</button><button className="icon-button" onClick={() => onMonthChange(addMonths(month, 1))} aria-label="下个月"><Icon name="next" /></button></div></div>
+    <DndContext sensors={sensors} onDragEnd={onDragEnd}>
+      <div className="calendar-layout"><div className="calendar-card"><div className="week-header">{['一', '二', '三', '四', '五', '六', '日'].map((day) => <span key={day}>{day}</span>)}</div><div className="calendar-grid">{days.map((date) => <CalendarDay key={date.toISOString()} date={date} month={month} tasks={tasks.filter((task) => taskCoversDate(task, format(date, 'yyyy-MM-dd')))} selected={format(date, 'yyyy-MM-dd') === selectedDate} onSelect={() => onSelectDate(format(date, 'yyyy-MM-dd'))} onSelectTask={onSelectTask} />)}</div></div>
+        <aside className="agenda-panel"><div className="agenda-heading"><div><span className="eyebrow">当天清单</span><h3>{format(parseISO(selectedDate), 'M月d日 · EEEE')}</h3></div><span className="agenda-count">{dayTasks.length}</span></div>{dayTasks.length ? <div className="agenda-list">{dayTasks.map((task) => <button key={task.id} className="agenda-item" onClick={() => onSelectTask(task.id)}><span className={`priority-line ${task.priority}`} /><span className="agenda-item-body"><strong>{task.title}</strong><small>{task.dueDate ? `截止 ${formatShortDate(task.dueDate)}` : '无截止日期'}{task.tags.length ? ` · ${task.tags.slice(0, 2).map((tag) => `#${tag}`).join(' ')}` : ''}</small></span><Icon name="arrow" /></button>)}</div> : <div className="empty-state compact"><span className="empty-glyph">◷</span><strong>这一天还没有任务</strong><p>在看板快速记录，或把任务拖到这里。</p></div>}</aside>
       </div>
     </DndContext>
     <div className="calendar-legend">{snapshot.statuses.map((status) => <span key={status.id}><i style={{ background: status.color }} />{status.name}</span>)}</div>
